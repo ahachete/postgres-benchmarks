@@ -32,8 +32,8 @@ uv run pgbench-log-to-hdr /opt/bench/runs/nvme-ext4/tpcb/20260509T140000Z/pgbenc
 # Plot TPS for two scenarios:
 uv run plot-tps \
     results/2026-05-XX/nvme-ext4/tpcb/20260509T140000Z \
-    results/2026-05-XX/nvme-zfs/tpcb/20260509T160000Z \
-    --label ext4 --label ZFS -o tps.png
+    results/2026-05-XX/zerofs/tpcb/20260509T160000Z \
+    --label NVMe --label "S3 (ZeroFS)" -o tps.png
 
 # Full campaign comparison:
 uv run compare-scenarios results/2026-05-XX/

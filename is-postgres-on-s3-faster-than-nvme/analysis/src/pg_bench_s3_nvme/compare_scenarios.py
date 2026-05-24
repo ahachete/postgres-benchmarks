@@ -49,6 +49,9 @@ from .plot_latency_pct import percentile_curve
 SCENARIO_ORDER = [
     "nvme-ext4",
     "nvme-zfs", "nvme-zfs-fpi", "nvme-zfs-rec32k",
+    "zerofs", "zerofs-standard", "zerofs-express",
+    "slatedb-nbd", "slatedb-nbd-standard", "slatedb-nbd-express",
+    "mountpoint",
 ]
 WORKLOADS = ("tpcb", "mixed")
 # Percentiles for the bar chart — the "usual suspects" most readers expect.

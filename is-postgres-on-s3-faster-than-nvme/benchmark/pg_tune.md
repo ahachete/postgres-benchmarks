@@ -71,11 +71,11 @@ map keyed by scenario name; anything constant lives at the top level.
 
 ## Per-scenario overrides
 
-| GUC | nvme-ext4 | nvme-zfs |
-|---|---|---|
-| [`full_page_writes`](https://postgresqlco.nf/doc/en/param/full_page_writes/) | `on` | `off` |
-| [`random_page_cost`](https://postgresqlco.nf/doc/en/param/random_page_cost/) | `1.1` | `1.1` |
-| [`effective_io_concurrency`](https://postgresqlco.nf/doc/en/param/effective_io_concurrency/) | `200` | `200` |
+| GUC | nvme-ext4 | nvme-zfs | zerofs | slatedb-nbd |
+|---|---|---|---|---|
+| [`full_page_writes`](https://postgresqlco.nf/doc/en/param/full_page_writes/) | `on` | `off` | `off` | `off` |
+| [`random_page_cost`](https://postgresqlco.nf/doc/en/param/random_page_cost/) | `1.1` | `1.1` | `4.0` | `4.0` |
+| [`effective_io_concurrency`](https://postgresqlco.nf/doc/en/param/effective_io_concurrency/) | `200` | `200` | `64` | `64` |
 
 ### `full_page_writes`
 On ZFS, when `recordsize` is greater than or equal to Postgres's page size
