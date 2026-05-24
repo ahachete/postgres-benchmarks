@@ -1,0 +1,12 @@
+---
+- name: Detect AMI bake state
+  ansible.builtin.stat:
+    path: /etc/pgbench/baked
+  register: __pgbench_baked
+
+- name: Bake-time tasks (PGDG repo + apt install + systemd overrides)
+  ansible.builtin.import_tasks: bake.yml
+  when: not __pgbench_baked.stat.exists
+
+- name: Runtime tasks (cluster wipe + create on scenario mount, render config, start)
+  ansible.builtin.import_tasks: runtime.yml

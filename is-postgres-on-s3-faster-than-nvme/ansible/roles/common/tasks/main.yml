@@ -1,0 +1,15 @@
+---
+# Dispatcher: heavy bake tasks run only on a fresh box; runtime tasks always.
+# The /etc/pgbench/baked sentinel is written by the AMI bake step and survives
+# in the AMI, so subsequent launches skip the bake half automatically.
+- name: Detect AMI bake state
+  ansible.builtin.stat:
+    path: /etc/pgbench/baked
+  register: __pgbench_baked
+
+- name: Bake-time tasks (apt installs, kernel-extra modules, persistent configs)
+  ansible.builtin.import_tasks: bake.yml
+  when: not __pgbench_baked.stat.exists
+
+- name: Runtime tasks (per-instance kernel modules, hugepage reservation, NVMe discovery)
+  ansible.builtin.import_tasks: runtime.yml

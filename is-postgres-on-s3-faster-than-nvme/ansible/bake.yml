@@ -1,0 +1,33 @@
+---
+# Bake playbook — runs ONLY the heavy/persistent bits of common + postgres
+# (apt installs, kernel-extra modules, sysctl, systemd unit overrides). It
+# does NOT run any scenario role and does NOT create the Postgres cluster.
+# After this completes successfully, scripts/bench-bake.sh writes the
+# /etc/pgbench/baked sentinel and snapshots the EC2 to an AMI.
+#
+# Usage:
+#   ansible-playbook bake.yml
+#
+# Subsequent launches that use the resulting AMI run site.yml, which detects
+# the sentinel and skips the bake half — only runtime tasks execute.
+
+- name: Postgres benchmark — bake AMI base layer
+  hosts: all
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Wait for SSH/SSM to settle after EC2 boot
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+  tasks:
+    - name: Apply common bake tasks
+      ansible.builtin.import_role:
+        name: common
+        tasks_from: bake.yml
+
+    - name: Apply postgres bake tasks
+      ansible.builtin.import_role:
+        name: postgres
+        tasks_from: bake.yml

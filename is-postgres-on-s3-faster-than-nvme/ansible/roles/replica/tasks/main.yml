@@ -1,0 +1,150 @@
+---
+# This role runs against the replica hosts. It delegates a few preparatory
+# tasks back to the primary so the replication user + slot exist before the
+# replica attempts pg_basebackup.
+
+# Both setup tasks below ("create password file", "create role") use
+# `run_once: true` — without it, Ansible runs them once per replica (each
+# delegated to primary) and they race. We saw the symptom in the wild:
+# both replicas pass the `IF NOT EXISTS` role check, both try CREATE ROLE,
+# one wins, the other gets `duplicate key value violates unique constraint
+# "pg_authid_rolname_index"`. The plpgsql IF NOT EXISTS / ELSE ALTER
+# pattern isn't atomic, so `run_once` is the simpler fix.
+#
+# Replica-side tasks that DO need to run per-replica (slot create with
+# per-replica name, pg_basebackup, primary_conninfo render, standby.signal,
+# etc.) follow below without `run_once`.
+
+- name: Ensure replication password exists on primary  (run_once)
+  ansible.builtin.shell: |
+    set -e
+    if [ ! -s {{ replication_password_path }} ]; then
+      head -c 32 /dev/urandom | base64 | tr -d '\n=+/' | head -c 32 > {{ replication_password_path }}
+      chmod 0600 {{ replication_password_path }}
+      chown postgres:postgres {{ replication_password_path }}
+    fi
+  changed_when: false
+  delegate_to: "{{ groups['primary'][0] }}"
+  run_once: true
+
+# Read the password fresh from the primary on each replica — `slurp` is
+# safe to run concurrently (read-only) and gives every replica a `rep_pass`
+# fact for the downstream tasks (basebackup, primary_conninfo) that need it.
+- name: Read replication password from primary
+  ansible.builtin.slurp:
+    src: "{{ replication_password_path }}"
+  register: rep_pass_raw
+  delegate_to: "{{ groups['primary'][0] }}"
+
+- name: Decode replication password into a fact
+  ansible.builtin.set_fact:
+    rep_pass_value: "{{ rep_pass_raw.content | b64decode | trim }}"
+
+# `SET LOCAL synchronous_commit = local` is required on the primary's
+# bootstrap-prep transactions: postgresql.conf already carries
+# `synchronous_standby_names = 'ANY 1 (replica1, replica2)'` from the postgres
+# role, but no replica is streaming yet (this role is what will bootstrap
+# them). Without the local override these commits would block forever
+# waiting on a peer that doesn't exist. The cluster-wide synchronous_commit
+# setting is unaffected — only the wrapping transaction sees `local`.
+- name: Create replication role on primary  (run_once)
+  ansible.builtin.command: >
+    psql -tAc "BEGIN;
+      SET LOCAL synchronous_commit = local;
+      DO $$
+        BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ replication_user }}') THEN
+            CREATE ROLE {{ replication_user }} WITH REPLICATION LOGIN PASSWORD '{{ rep_pass_value }}';
+          ELSE
+            ALTER ROLE {{ replication_user }} WITH REPLICATION LOGIN PASSWORD '{{ rep_pass_value }}';
+          END IF;
+        END $$;
+      COMMIT;"
+  changed_when: false
+  become_user: postgres
+  delegate_to: "{{ groups['primary'][0] }}"
+  run_once: true
+
+# Per-replica slot name → no race, no run_once needed.
+- name: Create physical replication slot on primary
+  ansible.builtin.command: >
+    psql -tAc "BEGIN;
+      SET LOCAL synchronous_commit = local;
+      SELECT pg_create_physical_replication_slot('slot_{{ inventory_hostname }}', true)
+             WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'slot_{{ inventory_hostname }}');
+      COMMIT;"
+  changed_when: false
+  become_user: postgres
+  delegate_to: "{{ groups['primary'][0] }}"
+
+- name: Stop Postgres on the replica before re-bootstrap
+  ansible.builtin.systemd:
+    name: "postgresql@{{ postgres_version }}-main"
+    state: stopped
+
+- name: Wipe replica's data directory contents
+  ansible.builtin.shell: |
+    set -e
+    if [ -d "{{ postgres_mount_dir }}/main" ]; then
+      find "{{ postgres_mount_dir }}/main" -mindepth 1 -delete
+    fi
+  changed_when: false
+
+- name: pg_basebackup the primary
+  ansible.builtin.command: >
+    pg_basebackup
+      --pgdata={{ postgres_mount_dir }}/main
+      --host={{ hostvars[groups['primary'][0]].private_ip }}
+      --port=5432
+      --username={{ replication_user }}
+      --wal-method=stream
+      --slot=slot_{{ inventory_hostname }}
+      --write-recovery-conf
+      --progress
+      --verbose
+      --checkpoint=fast
+  environment:
+    PGPASSWORD: "{{ rep_pass_value }}"
+  args:
+    creates: "{{ postgres_mount_dir }}/main/PG_VERSION"
+  become_user: postgres
+
+- name: Set application_name in primary_conninfo so quorum sync sees this replica
+  ansible.builtin.lineinfile:
+    path: "{{ postgres_mount_dir }}/main/postgresql.auto.conf"
+    regexp: '^primary_conninfo'
+    line: "primary_conninfo = 'host={{ hostvars[groups['primary'][0]].private_ip }} port=5432 user={{ replication_user }} password={{ rep_pass_value }} application_name={{ inventory_hostname }}'"
+  notify: restart postgres
+
+- name: Ensure standby.signal exists
+  ansible.builtin.file:
+    path: "{{ postgres_mount_dir }}/main/standby.signal"
+    state: touch
+    owner: postgres
+    group: postgres
+    mode: "0600"
+
+- name: Start Postgres on replica
+  ansible.builtin.systemd:
+    name: "postgresql@{{ postgres_version }}-main"
+    state: started
+
+# Query from the primary as the postgres superuser via the local socket
+# (peer auth). The protected columns of pg_stat_replication — including
+# `state` — return NULL for unprivileged roles, so connecting as the
+# `replicator` LOGIN role would silently observe state=NULL and never
+# match "streaming". Running on the primary also matches the semantics we
+# care about: by the time this returns, the primary itself acknowledges
+# this peer, and the next play can commit through the quorum sync path.
+- name: Wait for primary to see this replica in streaming state
+  ansible.builtin.command:
+    cmd: >-
+      psql -tAXc "SELECT state FROM pg_stat_replication
+                  WHERE application_name = '{{ inventory_hostname }}'"
+  register: rep_state
+  retries: 30
+  delay: 2
+  until: rep_state.stdout.strip() == "streaming"
+  changed_when: false
+  become_user: postgres
+  delegate_to: "{{ groups['primary'][0] }}"

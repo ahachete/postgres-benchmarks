@@ -1,0 +1,89 @@
+---
+# Centralized configuration for the benchmark — every Ansible role reads from
+# this file (and from the dynamic inventory's group_vars). Pin every external
+# dependency by version or commit SHA so a year from now the campaign is still
+# reproducible.
+
+postgres_version: "18"
+
+# All scenarios use the same data dir. Symlinked to the scenario-specific mount.
+postgres_data_dir: "/var/lib/postgresql/{{ postgres_version }}/main"
+postgres_mount_dir: "/mnt/pgdata"
+
+# Postgres tuning targets — derived from the host's actual RAM via
+# `ansible_memtotal_mb` so the same playbook works on the original
+# i7i.4xlarge (128 GB → shared_buffers ≈ 32 GB) and on smaller siblings
+# (i7i.2xlarge: 64 GB → shared_buffers ≈ 16 GB) when account vCPU quota
+# forces a downgrade for HA cluster runs.
+postgres_shared_buffers_mb: "{{ (ansible_memtotal_mb * 0.25) | int }}"
+postgres_effective_cache_size_mb: "{{ (ansible_memtotal_mb * 0.75) | int }}"
+postgres_wal_buffers_mb: 128
+# Raised from 16 → 96 GB so checkpoints stay time-triggered at write rates
+# up to ~250 MB/s WAL. The previous setting caused a checkpoint storm
+# (size-trigger every ~85 s mid-write of the previous checkpoint).
+postgres_max_wal_size_gb: 96
+postgres_checkpoint_timeout: "6min"
+postgres_work_mem_mb: 32
+postgres_maintenance_work_mem_mb: 2048
+
+# Scenario "family" — variants share tuning, differing only in storage knobs.
+# We strip the recordsize suffix (`-rec<N>k`) so e.g. `nvme-zfs-rec32k`
+# resolves to family `nvme-zfs`, sharing Postgres tuning.
+scenario_family: "{{ scenario | regex_replace('-(rec[0-9]+k)', '') }}"
+
+# Per-scenario ZFS recordsize. Postgres uses an 8K page size, so 8K matches
+# the page exactly. Larger sizes (32K, 128K) keep the atomic-page guarantee
+# (FPW=off is still safe at `recordsize >= 8K`) and trade per-page granularity
+# for better ZFS read-ahead and lower per-record metadata overhead. The blog
+# campaign uses 32K — empirically the sweet spot: TPS within noise of 8K, but
+# noticeably better latency percentiles.
+zfs_recordsize_for_scenario:
+  nvme-zfs:          "32K"
+  nvme-zfs-fpi:      "32K"
+  nvme-zfs-rec32k:   "32K"
+  nvme-zfs-rec128k:  "128K"
+zfs_recordsize: "{{ zfs_recordsize_for_scenario[scenario] | default('32K') }}"
+
+# Maps a scenario name to the Ansible role that prepares its storage. Roles
+# live under `roles/<role>/` — multiple scenarios can share one role and
+# differ only via vars.
+storage_role_for_scenario:
+  nvme-ext4: nvme-ext4
+  nvme-zfs: nvme-zfs
+  # Same ZFS storage as `nvme-zfs`, but with full_page_writes=on — the
+  # control case showing what FPW costs on a CoW filesystem where it's
+  # technically unnecessary.
+  nvme-zfs-fpi: nvme-zfs
+  # Same as nvme-zfs (FPW=off) but with 32K ZFS recordsize. ZFS's per-block
+  # metadata + checksum overhead scales inversely with recordsize; 32K is
+  # a common sweet spot trading per-page granularity for less ZFS overhead.
+  nvme-zfs-rec32k: nvme-zfs
+  # And the 128K extension — at smoke scale only so far; gives a directional
+  # answer to "does the tail-latency reduction trend continue past 32K?".
+  nvme-zfs-rec128k: nvme-zfs
+
+# Per-family Postgres tuning. Indexed by scenario_family.
+scenario_tuning:
+  nvme-ext4:
+    random_page_cost: 1.1
+    effective_io_concurrency: 200
+    full_page_writes: "on"
+  nvme-zfs:
+    random_page_cost: 1.1
+    effective_io_concurrency: 200
+    full_page_writes: "off"
+  # Same as nvme-zfs but FPW=on — the FPW-impact control.
+  nvme-zfs-fpi:
+    random_page_cost: 1.1
+    effective_io_concurrency: 200
+    full_page_writes: "on"
+
+# pgbench connection: local Unix socket via the postgres user (no password,
+# peer auth) — keeps the network out of the benchmark loop.
+pgbench_dbname: "bench"
+pgbench_user: "postgres"
+
+# NVMe device count expected on i7i.4xlarge: 1 × 3,750 GB Nitro SSD. The
+# `common` role queries /sys/block to discover ephemeral NVMe (size > 1 TB)
+# and asserts the count matches.
+expected_nvme_count: 1

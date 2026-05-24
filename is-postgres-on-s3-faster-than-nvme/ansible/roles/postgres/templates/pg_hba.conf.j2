@@ -1,0 +1,14 @@
+# pg_hba.conf — rendered by Ansible
+# Local socket = peer auth (the postgres user runs pgbench).
+# Intra-VPC = scram-sha-256, only from the 10.42.0.0/16 cluster network.
+
+# TYPE   DATABASE   USER          ADDRESS         METHOD
+local    all        all                           peer
+host     all        all           127.0.0.1/32    scram-sha-256
+host     all        all           ::1/128         scram-sha-256
+
+{% if cluster | default(false) %}
+# Replication traffic from the VPC.
+host     replication replicator   10.42.0.0/16    scram-sha-256
+host     all         all          10.42.0.0/16    scram-sha-256
+{% endif %}

@@ -1,0 +1,31 @@
+---
+- name: Bench dirs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0755"
+  loop:
+    - /opt/bench
+    - /opt/bench/runs
+    - /opt/bench/workloads
+
+- name: Ship benchmark workload scripts
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../benchmark/workloads/{{ item }}"
+    dest: "/opt/bench/workloads/{{ item }}"
+    owner: postgres
+    group: postgres
+    mode: "0644"
+  loop:
+    - mixed_75_5_20.sql
+    - init_mixed.sql
+
+- name: Ship run.sh
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../benchmark/run.sh"
+    dest: /opt/bench/run.sh
+    owner: postgres
+    group: postgres
+    mode: "0755"

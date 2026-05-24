@@ -1,0 +1,64 @@
+---
+# Per-instance runtime tasks — run on every launch (both bare and AMI-baked).
+
+- name: Load nbd kernel module (per-boot)
+  community.general.modprobe:
+    name: nbd
+    state: present
+    params: "nbds_max=8"
+
+- name: Load zfs kernel module (precompiled, from linux-modules-extra-aws)
+  community.general.modprobe:
+    name: zfs
+    state: present
+
+# Hugepages are reserved at boot via the persisted /etc/sysctl.d entry; the
+# kernel allocates from then-free memory. On a fresh EC2 with 128 GB RAM the
+# 17k pages always come through, but verify so any failure is loud.
+- name: Verify hugepage reservation actually succeeded
+  ansible.builtin.shell: |
+    set -eu
+    requested={{ ((postgres_shared_buffers_mb / 2) * 1.06) | int }}
+    actual=$(cat /proc/sys/vm/nr_hugepages)
+    free=$(grep ^HugePages_Free /proc/meminfo | awk '{print $2}')
+    echo "requested=$requested actual=$actual free=$free"
+    [ "$actual" -ge "$requested" ]
+  register: hugepage_check
+  changed_when: false
+
+- name: Bench output directory (created as root; postgres role chowns to postgres later)
+  ansible.builtin.file:
+    path: /opt/bench
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Discover ephemeral NVMe devices (size > 1 TB; excludes the EBS root)
+  ansible.builtin.shell: |
+    set -eu
+    for d in /sys/block/nvme*; do
+      [ -e "$d" ] || continue
+      name=$(basename "$d")
+      sz=$(cat "$d/size")
+      # Skip anything < 1 TB (root EBS volume is 50 GB).
+      if [ "$sz" -gt 2000000000 ]; then
+        echo "/dev/$name"
+      fi
+    done | sort
+  register: nvme_discovery
+  changed_when: false
+
+- name: Record discovered NVMe devices as a host fact
+  ansible.builtin.set_fact:
+    ephemeral_nvme_devices: "{{ nvme_discovery.stdout_lines }}"
+
+- name: Sanity-check NVMe device count matches expected
+  ansible.builtin.assert:
+    that:
+      - ephemeral_nvme_devices | length == expected_nvme_count
+    fail_msg: >
+      Expected {{ expected_nvme_count }} ephemeral NVMe disks, found
+      {{ ephemeral_nvme_devices | length }}: {{ ephemeral_nvme_devices }}.
+      Verify the EC2 instance type ({{ ansible_product_name | default('?') }})
+      actually has local NVMe instance store.

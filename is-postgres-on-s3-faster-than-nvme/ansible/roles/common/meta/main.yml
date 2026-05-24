@@ -1,0 +1,10 @@
+---
+galaxy_info:
+  role_name: common
+  description: Base packages, kernel tuning, NVMe discovery for the Postgres-on-S3-vs-NVMe benchmark.
+  license: Apache-2.0
+  min_ansible_version: "2.16"
+dependencies: []
+collections:
+  - community.general
+  - ansible.posix

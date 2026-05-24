@@ -1,0 +1,27 @@
+---
+# Database initialization on the primary. Runs as a separate site.yml play AFTER
+# the replica role has bootstrapped streaming peers (cluster mode) — so every
+# write here goes through the quorum sync path with `synchronous_standby_names`
+# already satisfied. In single-node mode no replicas exist and the play simply
+# creates the database against a standalone primary.
+#
+# This file is included via `tasks_from: database_init` from site.yml; do not
+# import it from main.yml (the postgres role's main entry point).
+
+- name: Check whether the benchmark database already exists
+  ansible.builtin.command: >
+    psql -tAc "SELECT 1 FROM pg_database WHERE datname = '{{ pgbench_dbname }}'"
+  register: bench_db_exists
+  changed_when: false
+  become_user: postgres
+
+- name: createdb {{ pgbench_dbname }}
+  ansible.builtin.command: "createdb {{ pgbench_dbname }}"
+  when: bench_db_exists.stdout != "1"
+  become_user: postgres
+
+- name: Enable pg_stat_statements in {{ pgbench_dbname }}
+  ansible.builtin.command: >
+    psql -d {{ pgbench_dbname }} -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements"
+  changed_when: false
+  become_user: postgres

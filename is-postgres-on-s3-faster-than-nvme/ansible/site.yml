@@ -1,0 +1,64 @@
+---
+- name: Postgres benchmark — bootstrap all nodes
+  hosts: all
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Wait for SSH to settle after EC2 boot
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+  roles:
+    - common
+
+- name: Postgres benchmark — provision storage scenario
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Apply scenario role (mapped via storage_role_for_scenario)
+      ansible.builtin.include_role:
+        name: "{{ storage_role_for_scenario[scenario] }}"
+
+- name: Postgres benchmark — install and configure Postgres
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Apply postgres role
+      ansible.builtin.include_role:
+        name: postgres
+
+- name: Postgres benchmark — configure replication (cluster mode only)
+  hosts: replicas
+  become: true
+
+  tasks:
+    - name: Apply replica role
+      ansible.builtin.include_role:
+        name: replica
+      when: cluster | bool
+
+# Database creation / user-data writes run only after replicas are streaming
+# (cluster mode) or immediately (single-node). In cluster mode this is the
+# first play where commits on the primary can be served by the quorum sync
+# path — see the comment in roles/postgres/tasks/runtime.yml.
+- name: Postgres benchmark — initialize bench database on the primary
+  hosts: primary
+  become: true
+
+  tasks:
+    - name: Apply database_init tasks from the postgres role
+      ansible.builtin.include_role:
+        name: postgres
+        tasks_from: database_init
+
+- name: Postgres benchmark — install benchmark tooling on the primary
+  hosts: primary
+  become: true
+
+  tasks:
+    - name: Apply benchmark role
+      ansible.builtin.include_role:
+        name: benchmark

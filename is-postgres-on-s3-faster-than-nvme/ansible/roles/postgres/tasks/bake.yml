@@ -1,0 +1,58 @@
+---
+# Bake-time tasks: install Postgres + dependencies + systemd unit overrides.
+# At end, drop the auto-created cluster and disable postgresql.service so the
+# AMI doesn't try to start a stale Postgres at boot of subsequent instances.
+
+- name: Install PGDG apt repository signing key
+  ansible.builtin.get_url:
+    url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+    dest: /usr/share/keyrings/postgresql.asc
+    mode: "0644"
+
+- name: Configure PGDG apt repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/usr/share/keyrings/postgresql.asc] http://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main"
+    filename: pgdg
+    state: present
+
+- name: Install Postgres {{ postgres_version }} packages
+  ansible.builtin.apt:
+    name:
+      - "postgresql-{{ postgres_version }}"
+      - "postgresql-client-{{ postgres_version }}"
+      - "postgresql-contrib-{{ postgres_version }}"
+    state: present
+    update_cache: true
+
+- name: Ensure systemd drop-in directory exists for the postgres unit
+  ansible.builtin.file:
+    path: "/etc/systemd/system/postgresql@{{ postgres_version }}-main.service.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Tighten systemd unit FD limits (persisted into AMI)
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/postgresql@{{ postgres_version }}-main.service.d/override.conf"
+    content: |
+      [Service]
+      LimitNOFILE=65536
+      LimitNOFILESoft=65536
+    mode: "0644"
+
+# AMI hygiene — apt postinst auto-creates a cluster at /var/lib/postgresql/<v>/main
+# and enables postgresql.service. We don't want either in the snapshot:
+# the cluster will be re-created at runtime against the scenario mount, and a
+# baked-in auto-start would conflict with that.
+- name: Drop the auto-created cluster (will be recreated at runtime)
+  ansible.builtin.command: "pg_dropcluster --stop {{ postgres_version }} main"
+  failed_when: false
+  changed_when: true
+
+- name: Disable postgresql.service (runtime tasks re-enable it after cluster create)
+  ansible.builtin.systemd:
+    name: postgresql.service
+    enabled: false
+    state: stopped
+  failed_when: false

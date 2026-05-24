@@ -1,0 +1,203 @@
+---
+# Heavy / persistent setup — runs once at AMI bake time, never on subsequent
+# launches from the baked AMI.
+
+- name: Disable unattended upgrades during benchmark window
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+    masked: true
+  loop:
+    - unattended-upgrades.service
+    - apt-daily.timer
+    - apt-daily-upgrade.timer
+  failed_when: false
+
+- name: Wait for any in-progress dpkg lock to clear
+  ansible.builtin.shell: |
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 2; done
+  changed_when: false
+
+- name: apt update
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 600
+
+# Belt-and-braces: zfs-dkms breaks on kernels newer than 6.6 and is NOT
+# needed on Ubuntu 24.04 with linux-modules-extra-aws (which ships zfs.ko
+# precompiled). Purge it if anything previously installed it — leaving it
+# in a half-configured state blocks every future apt operation.
+- name: Purge zfs-dkms if present (incompatible with kernel 6.17+, not needed)
+  ansible.builtin.apt:
+    name: zfs-dkms
+    state: absent
+    purge: true
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name:
+      # ZFS module ships precompiled in linux-modules-extra-aws (also in this
+      # apt list); zfsutils-linux gives us the userspace tools. No zfs-dkms
+      # compile required on Ubuntu 24.04 AWS kernels.
+      - parted
+      - nbd-client
+      - zfsutils-linux
+      # acl: ansible needs setfacl when chaining `become_user: postgres`
+      # from a non-root SSM session, otherwise temp-file permissions break.
+      - acl
+      - build-essential
+      - pkg-config
+      - libssl-dev
+      - libfuse2t64
+      - fuse3
+      - curl
+      - unzip
+      - jq
+      # zstd: run.sh compresses pgbench --log + iostat/vmstat logs before
+      # S3 upload (~4× smaller artifacts → much cheaper fetches). bench-fetch
+      # decompresses on the operator side before analysis.
+      - zstd
+      - rsync
+      - sysstat
+      - linux-tools-generic
+      - linux-modules-extra-aws
+      - python3
+      - python3-pip
+      - python3-psycopg2
+      - cargo
+      - rustc
+      - git
+    state: present
+    install_recommends: false
+
+# AWS CLI v2 from the official upstream .zip — Ubuntu 24.04 dropped the
+# `awscli` apt package (which was v1 anyway), and v2 is required for S3
+# Express directory-bucket support.
+- name: Check whether aws v2 is already installed
+  ansible.builtin.command: aws --version
+  register: aws_check
+  changed_when: false
+  failed_when: false
+
+- name: Install AWS CLI v2
+  when: aws_check.rc != 0 or 'aws-cli/2' not in (aws_check.stdout | default(''))
+  block:
+    - name: Download AWS CLI v2 installer
+      ansible.builtin.get_url:
+        url: "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
+        dest: /tmp/awscliv2.zip
+        mode: "0644"
+
+    - name: Unpack AWS CLI v2 installer
+      ansible.builtin.unarchive:
+        src: /tmp/awscliv2.zip
+        dest: /tmp/
+        remote_src: true
+
+    - name: Run the AWS CLI v2 installer
+      ansible.builtin.command: /tmp/aws/install --update
+      changed_when: true
+
+    - name: Clean up installer files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/awscliv2.zip
+        - /tmp/aws
+
+- name: Persist nbd module load across reboots
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/nbd.conf
+    content: |
+      nbd
+    owner: root
+    group: root
+    mode: "0644"
+
+# Sysctl tuning — written to /etc/sysctl.conf (persistent, applied at boot).
+# vm.nr_hugepages is here so the AMI carries the policy; the verify step in
+# runtime.yml double-checks the kernel actually allocated them post-boot.
+- name: Sysctl tuning for benchmark workloads (persisted)
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    sysctl_set: true
+    state: present
+    reload: true
+  loop:
+    - { name: vm.swappiness, value: "1" }
+    - { name: vm.dirty_background_ratio, value: "2" }
+    - { name: vm.dirty_ratio, value: "10" }
+    - { name: vm.overcommit_memory, value: "2" }
+    - { name: vm.overcommit_ratio, value: "80" }
+    - { name: kernel.sched_autogroup_enabled, value: "0" }
+    - { name: net.core.somaxconn, value: "4096" }
+    - name: vm.nr_hugepages
+      value: "{{ ((postgres_shared_buffers_mb / 2) * 1.06) | int }}"
+
+- name: Persist THP setting via systemd unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/disable-thp.service
+    content: |
+      [Unit]
+      Description=Disable Transparent Huge Pages (set to madvise) for Postgres
+      DefaultDependencies=no
+      After=sysinit.target local-fs.target
+      Before=basic.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/bin/sh -c 'echo madvise > /sys/kernel/mm/transparent_hugepage/enabled; echo madvise > /sys/kernel/mm/transparent_hugepage/defrag'
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=basic.target
+    mode: "0644"
+
+- name: Enable THP unit
+  ansible.builtin.systemd:
+    name: disable-thp.service
+    enabled: true
+    daemon_reload: true
+
+# CloudWatch agent — installed from AWS's official .deb. Polls /proc + a few
+# files every 60 s and ships memory / disk-usage / per-device diskio /
+# netstat metrics to the PgBench namespace, plus the postgres server log
+# and our run.log to CloudWatch Logs (7-day retention). Negligible overhead
+# at 60 s cadence; gives operational visibility during 10 h campaigns.
+- name: Download CloudWatch agent .deb
+  ansible.builtin.get_url:
+    url: "https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb"
+    dest: /tmp/amazon-cloudwatch-agent.deb
+    mode: "0644"
+
+- name: Install CloudWatch agent package
+  ansible.builtin.apt:
+    deb: /tmp/amazon-cloudwatch-agent.deb
+    state: present
+
+- name: Clean up the downloaded .deb
+  ansible.builtin.file:
+    path: /tmp/amazon-cloudwatch-agent.deb
+    state: absent
+
+- name: Render CloudWatch agent config
+  ansible.builtin.template:
+    src: cwagent-config.json.j2
+    dest: /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Fetch + start CloudWatch agent with the rendered config
+  # fetch-config translates the json into the agent's internal toml and
+  # enables+starts the systemd unit. Subsequent boots from the AMI start
+  # the agent automatically with this config.
+  ansible.builtin.command: >
+    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl
+    -a fetch-config -m ec2
+    -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+    -s
+  changed_when: true

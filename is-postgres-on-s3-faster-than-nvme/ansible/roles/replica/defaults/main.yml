@@ -1,0 +1,5 @@
+---
+replication_user: replicator
+# Generated once on the primary, fetched by replicas. Stored under /etc on
+# both sides with mode 0600 so it doesn't end up in the operator's working dir.
+replication_password_path: "/etc/postgresql/replicator.pass"

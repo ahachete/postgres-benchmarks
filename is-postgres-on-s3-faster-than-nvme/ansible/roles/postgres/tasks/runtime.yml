@@ -1,0 +1,121 @@
+---
+# Per-instance runtime: assumes Postgres binaries + systemd overrides are
+# already on the box (either from a fresh bake.yml run or a baked AMI).
+# Creates the cluster on the scenario-prepared mount and starts it.
+
+- name: Verify scenario-specific mount exists (prepared by the scenario role)
+  ansible.builtin.stat:
+    path: "{{ postgres_mount_dir }}"
+  register: pg_mount_stat
+
+- name: Fail loudly if the scenario role didn't prepare the mount
+  ansible.builtin.assert:
+    that:
+      - pg_mount_stat.stat.exists
+      - pg_mount_stat.stat.isdir
+    fail_msg: >
+      {{ postgres_mount_dir }} does not exist or is not a directory.
+      The {{ scenario }} role must run before postgres and create this mount.
+
+- name: Check whether the scenario mount already has a valid Postgres cluster
+  ansible.builtin.stat:
+    path: "{{ postgres_mount_dir }}/main/PG_VERSION"
+  register: __pg_version
+
+# Only stop + wipe registration when we'll re-create the cluster. On a
+# re-provision over an existing dataset, postgres stays running with its
+# rendered configs simply re-templated.
+- name: Stop the postgresql cluster (only when re-creating it)
+  ansible.builtin.systemd:
+    name: "postgresql@{{ postgres_version }}-main"
+    state: stopped
+  failed_when: false
+  when: not __pg_version.stat.exists
+
+# pg_dropcluster requires data dir + config dir to be in sync; when the
+# scenario role's reformat just nuked the data dir, the config dir is
+# orphaned. We clear the orphan bits ourselves — pg_createcluster will
+# recreate both. On a re-provision over an existing cluster (data still
+# there), we leave /etc/postgresql alone.
+- name: Wipe Debian cluster registration so pg_createcluster starts fresh
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/etc/postgresql/{{ postgres_version }}/main"
+    - "/var/lib/postgresql/{{ postgres_version }}/main"
+  when: not __pg_version.stat.exists
+
+- name: Create scenario-specific data directory parent
+  ansible.builtin.file:
+    path: "{{ postgres_mount_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0755"
+
+- name: pg_createcluster on the scenario mount
+  ansible.builtin.command: >
+    pg_createcluster
+    --datadir={{ postgres_mount_dir }}/main
+    --encoding=UTF8 --locale=C.UTF-8
+    --start-conf=manual
+    {{ postgres_version }} main
+  args:
+    creates: "{{ postgres_mount_dir }}/main/PG_VERSION"
+
+- name: Render tuned postgresql.conf
+  ansible.builtin.template:
+    src: postgresql.conf.j2
+    dest: "/etc/postgresql/{{ postgres_version }}/main/postgresql.conf"
+    owner: postgres
+    group: postgres
+    mode: "0644"
+  notify: restart postgres
+
+- name: Ensure data_directory in postgresql.conf points to scenario mount
+  ansible.builtin.lineinfile:
+    path: "/etc/postgresql/{{ postgres_version }}/main/postgresql.conf"
+    regexp: '^#?\s*data_directory\s*='
+    line: "data_directory = '{{ postgres_mount_dir }}/main'"
+    state: present
+
+- name: Render pg_hba.conf
+  ansible.builtin.template:
+    src: pg_hba.conf.j2
+    dest: "/etc/postgresql/{{ postgres_version }}/main/pg_hba.conf"
+    owner: postgres
+    group: postgres
+    mode: "0640"
+  notify: restart postgres
+
+- name: Bench output dir owned by postgres
+  ansible.builtin.file:
+    path: /opt/bench
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0755"
+
+- name: Reload systemd in case the bake's drop-in was added since last daemon-reload
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Start and enable Postgres
+  ansible.builtin.systemd:
+    name: "postgresql@{{ postgres_version }}-main"
+    state: started
+    enabled: true
+
+- name: Wait for Postgres to accept connections
+  ansible.builtin.wait_for:
+    port: 5432
+    host: 127.0.0.1
+    timeout: 60
+
+# Database creation and user-data writes are deliberately NOT in this role.
+# In cluster mode `synchronous_standby_names = 'ANY 1 (replica1, replica2)'`
+# is set in postgresql.conf from boot, so any commit on the primary blocks
+# until at least one replica is streaming — which the replica role bootstraps.
+# See site.yml: the database_init tasks run as a separate primary-only play
+# AFTER the replica play, when the quorum sync path is satisfied.

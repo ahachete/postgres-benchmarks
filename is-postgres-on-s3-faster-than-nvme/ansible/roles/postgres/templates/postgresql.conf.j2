@@ -1,0 +1,87 @@
+#
+# postgresql.conf — rendered by Ansible
+# Scenario: {{ scenario }}
+# Cluster:  {{ cluster | default(false) }}
+#
+# Tuning rationale: see benchmark/pg_tune.md and docs/design.md
+#
+
+# --- Connection ---
+listen_addresses = '*'
+port             = 5432
+max_connections  = 500
+
+# --- Memory ---
+shared_buffers           = {{ postgres_shared_buffers_mb }}MB
+effective_cache_size     = {{ postgres_effective_cache_size_mb }}MB
+work_mem                 = {{ postgres_work_mem_mb }}MB
+maintenance_work_mem     = {{ postgres_maintenance_work_mem_mb }}MB
+huge_pages               = on
+
+# --- WAL / checkpoints ---
+wal_level                       = logical
+wal_buffers                     = {{ postgres_wal_buffers_mb }}MB
+wal_compression                 = on
+max_wal_size                    = {{ postgres_max_wal_size_gb }}GB
+min_wal_size                    = 2GB
+checkpoint_timeout              = {{ postgres_checkpoint_timeout }}
+checkpoint_completion_target    = 0.9
+checkpoint_warning              = 30s
+synchronous_commit              = on
+full_page_writes                = {{ scenario_tuning[scenario_family].full_page_writes }}
+
+{% if cluster | default(false) %}
+# --- Replication (cluster mode) ---
+max_wal_senders                 = 10
+max_replication_slots           = 10
+hot_standby                     = on
+hot_standby_feedback            = on
+synchronous_standby_names       = 'ANY 1 (replica1, replica2)'
+# (commit_delay / commit_siblings deliberately left at defaults — adding
+#  per-commit delay would skew the latency we're trying to measure.)
+{% endif %}
+
+# --- Planner ---
+random_page_cost                = {{ scenario_tuning[scenario_family].random_page_cost }}
+seq_page_cost                   = 1.0
+effective_io_concurrency        = {{ scenario_tuning[scenario_family].effective_io_concurrency }}
+default_statistics_target       = 100
+jit                             = off
+
+# --- Background writer ---
+# Aggressive: drain dirty buffers between checkpoints so the checkpointer
+# has less to flush. shared_buffers=32GB makes for big checkpoints; the
+# first run hit maxwritten_clean=3988/4000 (bgwriter pinned at the cap),
+# so 8000 pages/50ms = ~1.28 GB/s of bgwriter capacity gives headroom.
+bgwriter_delay                  = 50ms
+bgwriter_lru_maxpages           = 8000
+bgwriter_lru_multiplier         = 10.0
+bgwriter_flush_after            = 512kB
+
+# --- Autovacuum ---
+autovacuum                              = on
+autovacuum_max_workers                  = 6
+autovacuum_naptime                      = 10s
+autovacuum_vacuum_scale_factor          = 0.05
+autovacuum_analyze_scale_factor         = 0.02
+autovacuum_vacuum_cost_limit            = 2000
+
+# --- Logging ---
+logging_collector               = on
+log_directory                   = 'log'
+log_filename                    = 'postgresql-%Y%m%d.log'
+log_rotation_age                = 1d
+log_rotation_size               = 0
+log_min_duration_statement      = -1
+log_checkpoints                 = on
+log_lock_waits                  = on
+log_autovacuum_min_duration     = 0
+log_line_prefix                 = '%t [%p] %q%u@%d '
+log_temp_files                  = 0
+
+# --- Statistics ---
+shared_preload_libraries        = 'pg_stat_statements'
+track_io_timing                 = on
+track_wal_io_timing             = on
+pg_stat_statements.max          = 10000
+pg_stat_statements.track        = all

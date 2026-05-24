@@ -1,0 +1,83 @@
+---
+- name: Stop any postgres cluster that may hold the mount
+  ansible.builtin.systemd:
+    name: "postgresql@{{ postgres_version }}-main"
+    state: stopped
+  failed_when: false
+
+- name: Unmount {{ postgres_mount_dir }} if mounted
+  ansible.posix.mount:
+    path: "{{ postgres_mount_dir }}"
+    state: unmounted
+  failed_when: false
+
+- name: Destroy any pre-existing ZFS pool 'bench'
+  ansible.builtin.shell: |
+    if zpool list bench >/dev/null 2>&1; then
+      zpool destroy -f bench
+    fi
+  changed_when: false
+
+- name: Wipe filesystem signatures on the NVMe device
+  ansible.builtin.command: "wipefs -a {{ ephemeral_nvme_devices[0] }}"
+  changed_when: false
+
+- name: Create ZFS pool 'bench' on the single NVMe disk
+  ansible.builtin.command: >
+    zpool create
+      -o ashift=12
+      -O atime=off
+      -O compression=off
+      -O xattr=sa
+      -O recordsize={{ zfs_recordsize }}
+      -O logbias=throughput
+      -O primarycache=metadata
+      -O mountpoint=none
+      bench
+      {{ ephemeral_nvme_devices[0] }}
+  args:
+    creates: /bench
+
+- name: Create dataset bench/pgdata mounted at {{ postgres_mount_dir }}
+  ansible.builtin.command: >
+    zfs create
+      -o mountpoint={{ postgres_mount_dir }}
+      -o recordsize={{ zfs_recordsize }}
+      -o primarycache=all
+      -o logbias=throughput
+      bench/pgdata
+  args:
+    creates: "{{ postgres_mount_dir }}/.zfs"
+  failed_when: false
+
+- name: Verify dataset is mounted
+  ansible.builtin.command: "zfs get -H -o value mounted bench/pgdata"
+  register: zfs_mounted
+  changed_when: false
+  failed_when: zfs_mounted.stdout != "yes"
+
+- name: Ensure mount target permissions (ownership left as root; postgres role chowns later)
+  ansible.builtin.file:
+    path: "{{ postgres_mount_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Record scenario metadata
+  ansible.builtin.copy:
+    dest: /opt/bench/scenario.json
+    content: |
+      {
+        "scenario": "{{ scenario }}",
+        "scenario_family": "nvme-zfs",
+        "filesystem": "zfs",
+        "pool_layout": "single-vdev",
+        "device": "{{ ephemeral_nvme_devices[0] }}",
+        "recordsize": "{{ zfs_recordsize }}",
+        "compression": "off",
+        "atime": "off",
+        "logbias": "throughput",
+        "full_page_writes": "off",
+        "results_bucket": "{{ results_bucket }}",
+        "aws_region": "{{ aws_region }}"
+      }
+    mode: "0644"

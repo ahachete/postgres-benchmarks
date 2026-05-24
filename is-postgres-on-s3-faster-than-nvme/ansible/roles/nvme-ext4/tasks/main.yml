@@ -1,0 +1,77 @@
+---
+# Idempotency: only reformat the NVMe if it isn't already laid out for this
+# scenario. We detect that by looking for the LABEL=pgdata on a 'real' (not
+# loop) device + an ext4 signature. This makes `make provision` a re-ship
+# operation rather than a destructive one — readers can bump benchmark
+# scripts without losing their multi-hour pgbench-init dataset.
+- name: Probe whether NVMe is already prepared (LABEL=pgdata on ext4)
+  ansible.builtin.shell: |
+    set -eu
+    src=$(blkid -L pgdata || true)
+    if [ -n "$src" ] && [ "$src" = "{{ ephemeral_nvme_devices[0] }}" ]; then
+      fst=$(blkid -o value -s TYPE "$src" || true)
+      [ "$fst" = "ext4" ] && echo prepared || echo missing
+    else
+      echo missing
+    fi
+  register: __nvme_state
+  changed_when: false
+
+- name: Format NVMe (only when not already prepared)
+  when: __nvme_state.stdout != "prepared"
+  block:
+    - name: Stop any postgres cluster that may still hold the mount
+      ansible.builtin.systemd:
+        name: "postgresql@{{ postgres_version }}-main"
+        state: stopped
+      failed_when: false
+
+    - name: Unmount {{ postgres_mount_dir }} if already mounted
+      ansible.posix.mount:
+        path: "{{ postgres_mount_dir }}"
+        state: unmounted
+      failed_when: false
+
+    - name: Wipe filesystem signatures on the NVMe device
+      ansible.builtin.command: "wipefs -a {{ ephemeral_nvme_devices[0] }}"
+      changed_when: false
+
+    - name: mkfs.ext4 on the NVMe device
+      community.general.filesystem:
+        fstype: ext4
+        dev: "{{ ephemeral_nvme_devices[0] }}"
+        opts: "-E lazy_itable_init=0,lazy_journal_init=0 -L pgdata"
+        force: true
+
+- name: Create mount target {{ postgres_mount_dir }}
+  ansible.builtin.file:
+    path: "{{ postgres_mount_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Mount NVMe at {{ postgres_mount_dir }}
+  ansible.posix.mount:
+    path: "{{ postgres_mount_dir }}"
+    src: LABEL=pgdata
+    fstype: ext4
+    # nofail + short device-timeout so an AMI boot whose NVMe lacks the
+    # `pgdata` label (i.e. before the scenario role re-mkfs's it) doesn't
+    # block local-fs.target for 90s and crash the box into emergency mode.
+    opts: "noatime,nodiratime,nobarrier,data=ordered,nofail,x-systemd.device-timeout=10"
+    state: mounted
+
+- name: Record scenario metadata
+  ansible.builtin.copy:
+    dest: /opt/bench/scenario.json
+    content: |
+      {
+        "scenario": "{{ scenario }}",
+        "scenario_family": "nvme-ext4",
+        "filesystem": "ext4",
+        "device": "{{ ephemeral_nvme_devices[0] }}",
+        "mount_options": "noatime,nodiratime,nobarrier,data=ordered",
+        "full_page_writes": "on",
+        "results_bucket": "{{ results_bucket }}",
+        "aws_region": "{{ aws_region }}"
+      }
+    mode: "0644"
