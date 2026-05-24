@@ -4,8 +4,8 @@ output "scenario" {
 }
 
 output "scenario_family" {
-  description = "Scenario family with the recordsize suffix stripped (e.g. nvme-zfs-rec32k → nvme-zfs)."
-  value       = replace(var.scenario, "/-rec[0-9]+k$/", "")
+  description = "Scenario family with the storage-class suffix stripped (zerofs-express → zerofs)."
+  value       = replace(replace(replace(var.scenario, "-express", ""), "-standard", ""), "/-rec[0-9]+k$/", "")
 }
 
 output "s3_class" {
@@ -88,7 +88,7 @@ output "ansible_inventory" {
   description = "Structured inventory consumed by ansible/inventory.py."
   value = {
     scenario        = var.scenario
-    scenario_family = replace(var.scenario, "/-rec[0-9]+k$/", "")
+    scenario_family = replace(replace(replace(var.scenario, "-express", ""), "-standard", ""), "/-rec[0-9]+k$/", "")
     s3_class        = local.is_express ? "express" : (local.is_standard_s3 ? "standard" : "")
     s3_endpoint_url = local.is_express ? "https://s3express-${local.az_ids[0]}.${var.region}.amazonaws.com" : ""
     cluster         = var.cluster

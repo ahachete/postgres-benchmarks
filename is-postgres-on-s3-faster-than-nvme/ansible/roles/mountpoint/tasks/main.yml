@@ -1,0 +1,118 @@
+---
+# This scenario exists to *document* that Postgres cannot run on Mountpoint
+# for S3. Mountpoint explicitly does not support modifying existing files
+# or file locking, both of which Postgres requires. We mount the bucket,
+# attempt initdb, and capture the failure for the blog post.
+
+- name: Stop any postgres cluster from a previous run
+  ansible.builtin.systemd:
+    name: "postgresql@{{ postgres_version }}-main"
+    state: stopped
+  failed_when: false
+
+- name: Unmount {{ postgres_mount_dir }} if mounted
+  ansible.builtin.command: "umount {{ postgres_mount_dir }}"
+  failed_when: false
+  changed_when: false
+
+# We need just the initdb binary to attempt initialization. The full postgres
+# role is skipped for mountpoint via site.yml, so we install the packages here.
+- name: Install PGDG apt key and repo (mountpoint variant)
+  block:
+    - name: PGDG signing key
+      ansible.builtin.get_url:
+        url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        dest: /usr/share/keyrings/postgresql.asc
+        mode: "0644"
+    - name: PGDG apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/usr/share/keyrings/postgresql.asc] http://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main"
+        filename: pgdg
+        state: present
+
+- name: Install Postgres {{ postgres_version }} (for the initdb attempt)
+  ansible.builtin.apt:
+    name: "postgresql-{{ postgres_version }}"
+    state: present
+    update_cache: true
+
+- name: Install mount-s3 from official .deb
+  ansible.builtin.apt:
+    deb: "{{ mountpoint_deb_url }}"
+    state: present
+
+- name: Create mount target {{ postgres_mount_dir }}
+  ansible.builtin.file:
+    path: "{{ postgres_mount_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0755"
+
+- name: Look up postgres uid/gid (postgresql-18 install just created them)
+  ansible.builtin.getent:
+    database: passwd
+    key: postgres
+
+- name: Mount the S3 bucket via Mountpoint
+  ansible.builtin.command: >
+    mount-s3
+      --uid={{ getent_passwd['postgres'][1] }}
+      --gid={{ getent_passwd['postgres'][2] }}
+      --allow-root
+      --allow-overwrite
+      --read-write
+      {{ bench_bucket }}
+      {{ postgres_mount_dir }}
+  args:
+    creates: "{{ postgres_mount_dir }}/.mountpoint-s3-meta"
+  register: mount_result
+  failed_when: false
+
+- name: Attempt initdb — expected to fail
+  ansible.builtin.command: >
+    /usr/lib/postgresql/{{ postgres_version }}/bin/initdb
+      --pgdata={{ postgres_mount_dir }}/main
+      --auth-local=peer
+      --auth-host=scram-sha-256
+      --encoding=UTF8
+      --locale=C.UTF-8
+  register: initdb_attempt
+  failed_when: false
+  changed_when: false
+  become_user: postgres
+
+- name: Record the documented failure
+  ansible.builtin.copy:
+    dest: /opt/bench/mountpoint_failure.json
+    content: |
+      {
+        "scenario": "mountpoint",
+        "mount_command_rc": {{ mount_result.rc | default('null') }},
+        "mount_command_stdout": {{ mount_result.stdout | default('') | to_json }},
+        "mount_command_stderr": {{ mount_result.stderr | default('') | to_json }},
+        "initdb_rc": {{ initdb_attempt.rc }},
+        "initdb_stdout": {{ initdb_attempt.stdout | to_json }},
+        "initdb_stderr": {{ initdb_attempt.stderr | to_json }},
+        "expected_failure": true,
+        "explanation": "Mountpoint for S3 does not support modifying existing files or file locking, both required by Postgres. See https://docs.aws.amazon.com/AmazonS3/latest/userguide/mountpoint.html"
+      }
+    mode: "0644"
+
+- name: Show captured failure for the operator's records
+  ansible.builtin.debug:
+    msg: |
+      Mountpoint initdb returned rc={{ initdb_attempt.rc }}.
+      Last 10 lines of stderr:
+      {{ initdb_attempt.stderr_lines[-10:] | default([]) | join('\n') }}
+
+- name: Upload mountpoint failure record to results bucket
+  ansible.builtin.command: >
+    aws s3 cp /opt/bench/mountpoint_failure.json
+              s3://{{ results_bucket }}/results/mountpoint/mountpoint_failure.json
+              --region {{ aws_region }}
+  changed_when: false
+
+- name: Skip the rest of the playbook for this scenario
+  ansible.builtin.set_fact:
+    skip_postgres_role: true

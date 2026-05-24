@@ -1,0 +1,63 @@
+# ZeroFS configuration — rendered by Ansible for {{ zerofs_version }}.
+# Schema reference: `zerofs init` from the same binary prints a fully
+# annotated template; if upstream changes the schema again, regenerate and
+# diff against this file.
+
+[cache]
+dir            = "{{ zerofs_disk_cache_dir }}"
+disk_size_gb   = {{ zerofs_disk_cache_gb }}.0
+memory_size_gb = {{ zerofs_memory_cache_gb }}.0
+
+[storage]
+# v1.1.6 takes a single storage URL. In cluster mode each node runs its
+# own ZeroFS daemon on its own data; we isolate them by `inventory_hostname`
+# prefix within the shared per-scenario bench bucket. Single-node mode
+# uses the same scheme (just `zerofs-primary/`) for consistency.
+url = "s3://{{ bench_bucket }}/zerofs-{{ inventory_hostname }}"
+# Encryption is mandatory in v1.1.6. The per-scenario bench bucket is
+# ephemeral (created + destroyed by terraform/ on every `make up`/`make
+# down`), so this password isn't protecting persistent data — it just
+# satisfies the schema. If you ever switch to a long-lived bucket, swap
+# this for a real secret (e.g. ${ZEROFS_PASSWORD} from a Vault-rendered
+# env file).
+encryption_password = "pgbench-not-a-secret"
+
+# Two servers are wired up:
+#   - NBD  — pgbench needs a block device under ZFS (the main I/O path).
+#   - 9P   — used once during provisioning to mkdir + `truncate` the NBD
+#            device-backing file inside the FS, since v1.1.6 moved device
+#            declaration from this config into `.nbd/<name>` files. Mounted
+#            briefly via the kernel 9P client, then unmounted.
+# NFS and the web UI are intentionally omitted.
+[servers.nbd]
+addresses = ["{{ zerofs_nbd_socket }}"]
+
+[servers.ninep]
+addresses = ["127.0.0.1:5564"]
+
+# IAM instance profile supplies credentials. We deliberately do NOT set
+# `endpoint`: the upstream `Barre/arrow-rs-object-store` fork (which ZeroFS
+# pins via Cargo) supports a dedicated `s3_express = "true"` flag that
+# auto-constructs the right virtual-hosted zonal URL
+# `<bucket>.s3express-<azid>.<region>.amazonaws.com` from the bucket
+# name's `--<azid>--x-s3` suffix AND switches auth to CreateSession-based
+# tokens. Setting `endpoint` ourselves would override that and produce
+# the path-style hostname that doesn't resolve.
+#
+# The `s3_express` flag is undocumented in `zerofs init`'s annotated
+# template but is forwarded through ZeroFS's generic `[aws]` config-key
+# passthrough (zerofs/src/parse_object_store.rs → AmazonS3Builder.with_config).
+[aws]
+default_region = "{{ aws_region }}"
+{% if s3_class == 'express' %}
+s3_express     = "true"
+{% endif %}
+
+# No [filesystem] quota — leave at upstream default (~16 EiB, effectively
+# unlimited). The NBD device size is controlled by the `truncate` of the
+# device-backing file in `.nbd/` (zerofs_nbd_size_gb), not here. Setting
+# max_size_gb equal to the device size leaves no headroom for LSM /
+# encryption metadata and breaks the device-file creation with ENOSPC.
+
+[lsm]
+wal_enabled = true

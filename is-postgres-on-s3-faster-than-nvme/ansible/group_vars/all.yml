@@ -27,32 +27,41 @@ postgres_work_mem_mb: 32
 postgres_maintenance_work_mem_mb: 2048
 
 # Scenario "family" — variants share tuning, differing only in storage knobs.
-# We strip the recordsize suffix (`-rec<N>k`) so e.g. `nvme-zfs-rec32k`
-# resolves to family `nvme-zfs`, sharing Postgres tuning.
-scenario_family: "{{ scenario | regex_replace('-(rec[0-9]+k)', '') }}"
+# We strip the storage-class suffixes (-standard / -express / -rec<N>k)
+# wherever they appear (not just at the end) so a scenario like
+# `zerofs-standard-ext4` resolves to family `zerofs-ext4`, sharing tuning
+# with `zerofs-express-ext4`. Keep the FS-layer suffix (`-ext4`) intact —
+# it changes Postgres tuning (FPW on/off, since ext4-on-NBD has no atomic
+# 8 K write guarantee).
+scenario_family: "{{ scenario | regex_replace('-(standard|express|rec[0-9]+k)', '') }}"
+s3_class: "{{ 'express' if '-express' in scenario else 'standard' }}"
 
 # Per-scenario ZFS recordsize. Postgres uses an 8K page size, so 8K matches
 # the page exactly. Larger sizes (32K, 128K) keep the atomic-page guarantee
 # (FPW=off is still safe at `recordsize >= 8K`) and trade per-page granularity
 # for better ZFS read-ahead and lower per-record metadata overhead. The blog
-# campaign uses 32K — empirically the sweet spot: TPS within noise of 8K, but
-# noticeably better latency percentiles.
+# campaign uses 32K — empirically the sweet spot on NVMe: TPS within noise
+# of 8K, but noticeably better latency percentiles. The S3-backed paths also
+# use 32K (the latency-amplifying effects of small writes compound over the
+# S3 round trip).
 zfs_recordsize_for_scenario:
   nvme-zfs:          "32K"
   nvme-zfs-fpi:      "32K"
   nvme-zfs-rec32k:   "32K"
   nvme-zfs-rec128k:  "128K"
+  zerofs-standard:   "32K"
+  zerofs-express:    "32K"
 zfs_recordsize: "{{ zfs_recordsize_for_scenario[scenario] | default('32K') }}"
 
 # Maps a scenario name to the Ansible role that prepares its storage. Roles
 # live under `roles/<role>/` — multiple scenarios can share one role and
-# differ only via vars.
+# differ only via vars (s3_class, s3_endpoint_url, bench_bucket).
 storage_role_for_scenario:
   nvme-ext4: nvme-ext4
   nvme-zfs: nvme-zfs
   # Same ZFS storage as `nvme-zfs`, but with full_page_writes=on — the
   # control case showing what FPW costs on a CoW filesystem where it's
-  # technically unnecessary.
+  # technically unnecessary. Mirrors the Neon "what FPW=off bought us" story.
   nvme-zfs-fpi: nvme-zfs
   # Same as nvme-zfs (FPW=off) but with 32K ZFS recordsize. ZFS's per-block
   # metadata + checksum overhead scales inversely with recordsize; 32K is
@@ -61,6 +70,14 @@ storage_role_for_scenario:
   # And the 128K extension — at smoke scale only so far; gives a directional
   # answer to "does the tail-latency reduction trend continue past 32K?".
   nvme-zfs-rec128k: nvme-zfs
+  zerofs-standard: zerofs
+  zerofs-express: zerofs
+  # The `-ext4` variants share the zerofs role but skip the zpool create
+  # step and mkfs.ext4 directly on /dev/nbd0 — quantifies "what does ZFS
+  # buy us on top of the S3-backed NBD device?"
+  zerofs-standard-ext4: zerofs
+  zerofs-express-ext4: zerofs
+  mountpoint: mountpoint
 
 # Per-family Postgres tuning. Indexed by scenario_family.
 scenario_tuning:
@@ -77,6 +94,38 @@ scenario_tuning:
     random_page_cost: 1.1
     effective_io_concurrency: 200
     full_page_writes: "on"
+  zerofs:
+    random_page_cost: 4
+    effective_io_concurrency: 64
+    full_page_writes: "off"
+  # ZeroFS NBD device formatted directly as ext4 (no ZFS on top). ext4 has
+  # no atomic-page guarantee, so torn pages are a real hazard — FPW must
+  # be on. Net effect on S3: every dirty 8 K page becomes ~16 K of WAL
+  # (page header + data). We expect this scenario to show much higher WAL
+  # volume and much lower TPS than `zerofs` (ZFS, FPW off) — but it's the
+  # honest comparison for "what if you don't want a CoW filesystem layer?"
+  zerofs-ext4:
+    random_page_cost: 4
+    effective_io_concurrency: 64
+    full_page_writes: "on"
+  mountpoint:
+    random_page_cost: 4
+    effective_io_concurrency: 64
+    full_page_writes: "off"
+
+# Pinned versions of S3-backed storage layers. The ZeroFS binary release
+# and sha256 live in roles/zerofs/defaults/main.yml; the cache sizes are
+# kept here so other roles can reference them if needed.
+zerofs_disk_cache_gb: 200
+zerofs_memory_cache_gb: 4
+
+# slatedb-nbd: dropped from the campaign. Upstream repo
+# (https://github.com/john-parton/slatedb-nbd) is a single-author proof of
+# concept abandoned since 2025-08, with no binary releases and unfixed
+# Rust edition-2024 issues. ZeroFS uses SlateDB internally and is the
+# maintained representative of that architecture.
+
+mountpoint_deb_url: "https://s3.amazonaws.com/mountpoint-s3-release/latest/x86_64/mount-s3.deb"
 
 # pgbench connection: local Unix socket via the postgres user (no password,
 # peer auth) — keeps the network out of the benchmark loop.

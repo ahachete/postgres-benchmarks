@@ -33,6 +33,14 @@ BUCKET="$(results_bucket)"
 DEST="$RESULTS_DIR/$TAG/$SCENARIO"
 mkdir -p "$DEST"
 
+if [[ "$SCENARIO" == "mountpoint" ]]; then
+  info "==> Fetching mountpoint failure record into $DEST"
+  aws s3 cp --region "$REGION" \
+      "s3://$BUCKET/results/mountpoint/mountpoint_failure.json" \
+      "$DEST/" || warn "no failure record uploaded yet"
+  exit 0
+fi
+
 info "==> Fetching benchmark artifacts from s3://$BUCKET/results/$SCENARIO/ → $DEST"
 aws s3 sync --region "$REGION" \
     "s3://$BUCKET/results/$SCENARIO/" \

@@ -43,8 +43,10 @@ rm -rf /etc/postgresql/18/main /var/lib/postgresql/18/main
 # Unmount + remove fstab entries that reference scenario mounts. Use grep
 # rewrite (not sed-with-alt-delimiter) so it's robust to quoting / escaping.
 umount /mnt/pgdata 2>/dev/null || true
+umount /mnt/zerofs-cache 2>/dev/null || true
+umount /mnt/slatedb-cache 2>/dev/null || true
 if [ -f /etc/fstab ]; then
-  grep -vE '/mnt/pgdata' /etc/fstab > /etc/fstab.bake.tmp || true
+  grep -vE '/mnt/(pgdata|zerofs-cache|slatedb-cache)' /etc/fstab > /etc/fstab.bake.tmp || true
   mv /etc/fstab.bake.tmp /etc/fstab
 fi
 

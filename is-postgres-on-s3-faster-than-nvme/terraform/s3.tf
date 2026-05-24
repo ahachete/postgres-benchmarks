@@ -42,7 +42,8 @@ resource "aws_s3_bucket_lifecycle_configuration" "standard" {
   count  = var.keep_bucket ? 0 : 1
   bucket = aws_s3_bucket.standard.id
 
-  # Keep the bucket clean of orphaned multipart parts.
+  # ZeroFS / slatedb-nbd churn multipart uploads heavily; keep the bucket
+  # clean of orphaned parts.
   rule {
     id     = "cleanup-multipart"
     status = "Enabled"

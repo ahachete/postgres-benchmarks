@@ -1,0 +1,299 @@
+---
+- name: Stop any postgres cluster that may hold the mount
+  ansible.builtin.systemd:
+    name: "postgresql@{{ postgres_version }}-main"
+    state: stopped
+  failed_when: false
+
+- name: Tear down stale state if re-running
+  block:
+    - name: Unmount {{ postgres_mount_dir }}
+      ansible.posix.mount:
+        path: "{{ postgres_mount_dir }}"
+        state: unmounted
+      failed_when: false
+
+    - name: Unmount ZeroFS cache mount
+      ansible.posix.mount:
+        path: "{{ zerofs_disk_cache_dir }}"
+        state: unmounted
+      failed_when: false
+
+    - name: Destroy any pre-existing ZFS pool 'bench'
+      ansible.builtin.shell: |
+        if zpool list bench >/dev/null 2>&1; then zpool destroy -f bench; fi
+      changed_when: false
+
+    - name: Disconnect any NBD client
+      ansible.builtin.command: "nbd-client -d /dev/nbd0"
+      failed_when: false
+      changed_when: false
+
+    - name: Unmount any stale 9P temp mount used for device-file creation
+      ansible.builtin.shell: |
+        if mountpoint -q /mnt/zerofs-9p; then umount /mnt/zerofs-9p; fi
+      changed_when: false
+      failed_when: false
+
+    - name: Stop any running zerofs service
+      ansible.builtin.systemd:
+        name: zerofs
+        state: stopped
+      failed_when: false
+
+# -------------------------------------------------------------------------
+# Partition the single NVMe disk: p1 = daemon cache, p2 = ZFS L2ARC.
+# Wipefs first to clear any prior signatures (we may be re-running over
+# an existing layout from another scenario).
+# -------------------------------------------------------------------------
+- name: Wipe filesystem signatures on the NVMe device
+  ansible.builtin.command: "wipefs -a {{ ephemeral_nvme_devices[0] }}"
+  changed_when: false
+
+- name: Create GPT label and two partitions (cache + L2ARC)
+  ansible.builtin.shell: |
+    set -e
+    parted -s {{ ephemeral_nvme_devices[0] }} mklabel gpt
+    parted -s {{ ephemeral_nvme_devices[0] }} mkpart primary 1MiB {{ zerofs_disk_cache_gb }}GiB
+    parted -s {{ ephemeral_nvme_devices[0] }} mkpart primary {{ zerofs_disk_cache_gb }}GiB 100%
+    partprobe {{ ephemeral_nvme_devices[0] }}
+    udevadm settle
+  changed_when: true
+
+- name: Set partition device-name facts (handles /dev/nvme1n1 → /dev/nvme1n1p1)
+  ansible.builtin.set_fact:
+    zerofs_cache_partition: "{{ ephemeral_nvme_devices[0] }}p{{ zerofs_cache_partition_index }}"
+    zerofs_l2arc_partition: "{{ ephemeral_nvme_devices[0] }}p{{ zerofs_l2arc_partition_index }}"
+
+- name: Format the ZeroFS local-disk-cache partition (ext4)
+  community.general.filesystem:
+    fstype: ext4
+    dev: "{{ zerofs_cache_partition }}"
+    opts: "-L zerofs-cache"
+    force: true
+
+- name: Mount the ZeroFS local-disk-cache partition
+  ansible.posix.mount:
+    path: "{{ zerofs_disk_cache_dir }}"
+    src: LABEL=zerofs-cache
+    fstype: ext4
+    opts: "noatime,nodiratime,nofail,x-systemd.device-timeout=10"
+    state: mounted
+
+- name: Set permissions on cache dir
+  ansible.builtin.file:
+    path: "{{ zerofs_disk_cache_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# Install the pinned ZeroFS binary release rather than compiling from source.
+# Upstream publishes PGO-optimized multi-platform binaries on each tag at
+# https://github.com/Barre/ZeroFS/releases — using them avoids depending on a
+# specific Rust toolchain version (the source tree requires edition 2024,
+# which Ubuntu 24.04's system rustc doesn't support) and yields the
+# upstream-optimized binary at a tagged, sha256-pinned version.
+- name: Ensure ZeroFS install dirs exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ zerofs_install_dir }}"
+    - "{{ zerofs_install_dir }}/bin"
+
+- name: Download ZeroFS {{ zerofs_version }} release tarball (sha256-verified)
+  ansible.builtin.get_url:
+    url: "{{ zerofs_release_url }}"
+    dest: "/tmp/zerofs-{{ zerofs_version }}.tar.gz"
+    checksum: "sha256:{{ zerofs_release_sha256 }}"
+    mode: "0644"
+
+- name: Install the Linux amd64 ZeroFS binary to {{ zerofs_bin }}
+  ansible.builtin.shell: |
+    set -e
+    tar -xzf /tmp/zerofs-{{ zerofs_version }}.tar.gz \
+        -C /tmp {{ zerofs_release_arch_member }}
+    install -m 0755 /tmp/{{ zerofs_release_arch_member }} {{ zerofs_bin }}
+    rm -f /tmp/{{ zerofs_release_arch_member }}
+  args:
+    creates: "{{ zerofs_bin }}"
+
+- name: Render ZeroFS configuration
+  ansible.builtin.template:
+    src: zerofs.toml.j2
+    dest: /etc/zerofs.toml
+    owner: root
+    group: root
+    mode: "0640"
+
+- name: Render ZeroFS systemd unit
+  ansible.builtin.template:
+    src: zerofs.service.j2
+    dest: /etc/systemd/system/zerofs.service
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Start ZeroFS
+  ansible.builtin.systemd:
+    name: zerofs
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Wait for ZeroFS NBD socket to become reachable
+  ansible.builtin.wait_for:
+    host: "127.0.0.1"
+    port: 10809
+    timeout: 30
+
+- name: Wait for ZeroFS 9P socket to become reachable
+  ansible.builtin.wait_for:
+    host: "127.0.0.1"
+    port: 5564
+    timeout: 30
+
+# v1.1.6+ moved NBD device declaration from the TOML config into files
+# inside the filesystem (`.nbd/<name>` — size taken from the file size,
+# name becomes the NBD export name). To create that file we briefly mount
+# the FS over 9P (kernel-native, no userspace deps unlike NFS), `mkdir`
+# `.nbd`, `truncate` the device-backing file, and unmount. ZeroFS picks
+# the new device up dynamically. The whole block is gated on whether NBD
+# is already connected (creates: /sys/block/nbd0/pid) so re-runs no-op.
+- name: Ensure 9p kernel module is loaded
+  community.general.modprobe:
+    name: 9p
+    state: present
+
+- name: Create the NBD device-backing file via a one-shot 9P mount
+  ansible.builtin.shell: |
+    set -e
+    mkdir -p /mnt/zerofs-9p
+    if ! mountpoint -q /mnt/zerofs-9p; then
+      mount -t 9p -o "trans=tcp,port=5564,version=9p2000.L,uname=root" \
+            127.0.0.1 /mnt/zerofs-9p
+    fi
+    mkdir -p /mnt/zerofs-9p/.nbd
+    if [ ! -e "/mnt/zerofs-9p/.nbd/{{ zerofs_nbd_export }}" ]; then
+      truncate -s {{ zerofs_nbd_size_gb }}G "/mnt/zerofs-9p/.nbd/{{ zerofs_nbd_export }}"
+    fi
+    umount /mnt/zerofs-9p
+  args:
+    creates: /sys/block/nbd0/pid
+  changed_when: false
+
+- name: Connect nbd-client to ZeroFS export
+  ansible.builtin.command: >
+    nbd-client -N {{ zerofs_nbd_export }} 127.0.0.1 10809 /dev/nbd0
+  args:
+    creates: /sys/block/nbd0/pid
+
+- name: Wait for /dev/nbd0 to settle
+  ansible.builtin.command: "blockdev --getsize64 /dev/nbd0"
+  register: nbd_size
+  retries: 10
+  delay: 1
+  until: nbd_size.rc == 0
+  changed_when: false
+
+- name: Wipe filesystem signatures on /dev/nbd0
+  ansible.builtin.command: "wipefs -a /dev/nbd0"
+  changed_when: false
+
+# Two filesystem layouts on top of /dev/nbd0:
+#   - ZFS (default): striped pool over /dev/nbd0 with L2ARC on the local
+#     NVMe partition. FPW=off in postgresql.conf (CoW safe).
+#   - ext4 (`-ext4` variants): mkfs.ext4 directly on /dev/nbd0. No L2ARC.
+#     FPW=on in postgresql.conf (no atomic-page guarantee). Used to
+#     quantify what ZFS buys us on top of the S3-backed NBD device.
+- name: Create ZFS pool 'bench' on /dev/nbd0 with L2ARC on the local NVMe partition
+  ansible.builtin.command: >
+    zpool create
+      -o ashift=12
+      -O atime=off
+      -O compression=off
+      -O xattr=sa
+      -O recordsize={{ zfs_recordsize }}
+      -O logbias=throughput
+      -O primarycache=all
+      -O mountpoint=none
+      bench
+      /dev/nbd0
+      cache {{ zerofs_l2arc_partition }}
+  args:
+    creates: /bench
+  when: scenario_family != 'zerofs-ext4'
+
+- name: Create dataset bench/pgdata mounted at {{ postgres_mount_dir }}
+  ansible.builtin.command: >
+    zfs create
+      -o mountpoint={{ postgres_mount_dir }}
+      -o recordsize={{ zfs_recordsize }}
+      -o primarycache=all
+      -o logbias=throughput
+      bench/pgdata
+  args:
+    creates: "{{ postgres_mount_dir }}/.zfs"
+  failed_when: false
+  when: scenario_family != 'zerofs-ext4'
+
+- name: Verify ZFS dataset is mounted
+  ansible.builtin.command: "zfs get -H -o value mounted bench/pgdata"
+  register: zfs_mounted
+  changed_when: false
+  failed_when: zfs_mounted.stdout != "yes"
+  when: scenario_family != 'zerofs-ext4'
+
+- name: Format /dev/nbd0 as ext4 (zerofs-*-ext4 variants only)
+  community.general.filesystem:
+    fstype: ext4
+    dev: /dev/nbd0
+    opts: "-L pgdata"
+    force: true
+  when: scenario_family == 'zerofs-ext4'
+
+- name: Mount the ext4 filesystem at {{ postgres_mount_dir }}
+  ansible.posix.mount:
+    path: "{{ postgres_mount_dir }}"
+    src: LABEL=pgdata
+    fstype: ext4
+    opts: "noatime,nodiratime,nofail,x-systemd.device-timeout=10"
+    state: mounted
+  when: scenario_family == 'zerofs-ext4'
+
+- name: Ensure mount target permissions (ownership left as root; postgres role chowns later)
+  ansible.builtin.file:
+    path: "{{ postgres_mount_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Record scenario metadata
+  ansible.builtin.copy:
+    dest: /opt/bench/scenario.json
+    content: |
+      {
+        "scenario": "{{ scenario }}",
+        "scenario_family": "{{ scenario_family }}",
+        "s3_class": "{{ s3_class }}",
+        "s3_endpoint_url": "{{ s3_endpoint_url }}",
+        "s3_bucket": "{{ bench_bucket }}",
+        "s3_az_id": "{{ primary_az_id }}",
+        "aws_region": "{{ aws_region }}",
+        "zerofs_version": "{{ zerofs_version }}",
+        "zerofs_release_sha256": "{{ zerofs_release_sha256 }}",
+        "filesystem": "{{ 'ext4' if scenario_family == 'zerofs-ext4' else 'zfs' }}",
+        "block_device": "/dev/nbd0",
+        "nvme_device": "{{ ephemeral_nvme_devices[0] }}",
+        "zerofs_disk_cache_partition": "{{ zerofs_cache_partition }}",
+        "l2arc_partition": "{{ zerofs_l2arc_partition }}",
+        "zerofs_disk_cache_gb": {{ zerofs_disk_cache_gb }},
+        "zerofs_memory_cache_gb": {{ zerofs_memory_cache_gb }},
+        "recordsize": "{{ zfs_recordsize if scenario_family != 'zerofs-ext4' else 'n/a' }}",
+        "full_page_writes": "{{ scenario_tuning[scenario_family].full_page_writes }}",
+        "results_bucket": "{{ results_bucket }}"
+      }
+    mode: "0644"

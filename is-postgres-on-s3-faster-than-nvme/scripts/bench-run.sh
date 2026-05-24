@@ -27,6 +27,13 @@ done
 [[ -n "$SCENARIO" ]] || { err "--scenario required"; exit 2; }
 [[ -n "$WORKLOAD" ]] || { err "--workload required"; exit 2; }
 
+if [[ "$SCENARIO" == "mountpoint" ]]; then
+  warn "Scenario 'mountpoint' is the documented-failure case — no benchmark will run."
+  warn "The provisioning step already captured the failure to /opt/bench/mountpoint_failure.json."
+  warn "Run 'make fetch SCENARIO=mountpoint' to retrieve it."
+  exit 0
+fi
+
 require_tf
 require_ssm
 require jq

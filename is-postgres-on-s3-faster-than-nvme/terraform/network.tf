@@ -56,9 +56,8 @@ resource "aws_route_table_association" "public" {
 }
 
 # S3 gateway endpoint: zero-cost in-region traffic between EC2 and S3.
-# The benchmark uses S3 only as a result-artifact destination, but without
-# the endpoint that traffic would route through the IGW and incur egress
-# charges. Cheap insurance.
+# Without this, every byte ZeroFS / slatedb-nbd / Mountpoint reads or writes
+# to S3 routes through the IGW and incurs NAT/egress charges.
 resource "aws_vpc_endpoint" "s3" {
   vpc_id            = aws_vpc.this.id
   service_name      = "com.amazonaws.${var.region}.s3"

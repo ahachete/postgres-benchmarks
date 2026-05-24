@@ -1,0 +1,27 @@
+---
+# Pin to an upstream binary release for reproducibility. Bump both fields
+# together; sha256 is the checksum of the multi-platform tarball published
+# at https://github.com/Barre/ZeroFS/releases.
+zerofs_version: "v1.1.6"
+zerofs_release_url: "https://github.com/Barre/ZeroFS/releases/download/{{ zerofs_version }}/zerofs-pgo-multiplatform.tar.gz"
+zerofs_release_sha256: "0da6d831eb1e98e172093b838ba3a4cd271a01ca49421af2b8a5852916fe2716"
+# The tarball ships per-arch binaries at the root; we install the Linux amd64
+# PGO build for the i7i.4xlarge (Intel x86_64) hardware.
+zerofs_release_arch_member: "zerofs-linux-amd64-pgo"
+
+zerofs_install_dir: "/opt/zerofs"
+zerofs_bin: "/opt/zerofs/bin/zerofs"
+
+zerofs_disk_cache_dir: "/mnt/zerofs-cache"
+zerofs_disk_cache_gb: 200
+zerofs_memory_cache_gb: 4
+
+zerofs_nbd_export: "pgdata"
+zerofs_nbd_size_gb: 500
+zerofs_nbd_socket: "127.0.0.1:10809"
+
+# Single NVMe disk on i7i.4xlarge is partitioned into two parts:
+#   p1 → ZeroFS local disk cache (cold-read path) — sized by zerofs_disk_cache_gb
+#   p2 → ZFS L2ARC (hot Postgres-page cache)      — remainder
+zerofs_cache_partition_index: 1
+zerofs_l2arc_partition_index: 2

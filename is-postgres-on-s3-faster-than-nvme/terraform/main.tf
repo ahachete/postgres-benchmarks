@@ -34,11 +34,11 @@ locals {
   is_cluster  = var.cluster
   node_count  = var.cluster ? 3 : 1
 
-  # Reserved for future S3-backed scenarios (kept as inert defaults so the
-  # rest of the stack's plumbing — bucket creation, outputs, ansible inventory
-  # JSON — keeps the same shape regardless of scenario).
-  is_s3_scenario       = false
-  is_express           = false
-  is_standard_s3       = false
-  needs_directory_bckt = false
+  # Whether this scenario uses S3 at all, and which class (Standard / Express).
+  # `is_express` matches both `*-express` and `*-express-ext4` — the FS-layer
+  # suffix doesn't change the S3 tier.
+  is_s3_scenario       = contains(["zerofs-standard", "zerofs-express", "zerofs-standard-ext4", "zerofs-express-ext4", "mountpoint"], var.scenario)
+  is_express           = strcontains(var.scenario, "-express")
+  is_standard_s3       = local.is_s3_scenario && !local.is_express
+  needs_directory_bckt = local.is_express
 }

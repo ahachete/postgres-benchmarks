@@ -1,19 +1,22 @@
 variable "region" {
-  description = "AWS region. us-east-2 (Ohio) is the default — fewer notorious incidents than us-east-1, S3 gateway endpoint = $0 in-region traffic."
+  description = "AWS region. us-east-2 (Ohio) is the default — fewer notorious incidents than us-east-1, S3 Express GA, S3 gateway endpoint = $0 in-region traffic."
   type        = string
   default     = "us-east-2"
 }
 
 variable "scenario" {
-  description = "Storage scenario: nvme-ext4, nvme-zfs, nvme-zfs-fpi, nvme-zfs-rec32k, nvme-zfs-rec128k."
+  description = "Storage scenario: nvme-ext4, nvme-zfs, nvme-zfs-fpi, nvme-zfs-rec32k, zerofs-standard, zerofs-express, zerofs-standard-ext4, zerofs-express-ext4, mountpoint."
   type        = string
   default     = "nvme-ext4"
 
   validation {
     condition = contains([
       "nvme-ext4", "nvme-zfs", "nvme-zfs-fpi", "nvme-zfs-rec32k", "nvme-zfs-rec128k",
+      "zerofs-standard", "zerofs-express",
+      "zerofs-standard-ext4", "zerofs-express-ext4",
+      "mountpoint",
     ], var.scenario)
-    error_message = "scenario must be one of: nvme-ext4, nvme-zfs, nvme-zfs-fpi, nvme-zfs-rec{32,128}k."
+    error_message = "scenario must be one of: nvme-ext4, nvme-zfs, nvme-zfs-fpi, nvme-zfs-rec{32,128}k, zerofs-standard, zerofs-express, zerofs-{standard,express}-ext4, mountpoint."
   }
 }
 

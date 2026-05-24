@@ -26,9 +26,10 @@
   become: true
 
   tasks:
-    - name: Apply postgres role
+    - name: Apply postgres role unless this is the mountpoint failure scenario
       ansible.builtin.include_role:
         name: postgres
+      when: scenario != 'mountpoint'
 
 - name: Postgres benchmark — configure replication (cluster mode only)
   hosts: replicas
@@ -53,12 +54,14 @@
       ansible.builtin.include_role:
         name: postgres
         tasks_from: database_init
+      when: scenario != 'mountpoint'
 
 - name: Postgres benchmark — install benchmark tooling on the primary
   hosts: primary
   become: true
 
   tasks:
-    - name: Apply benchmark role
+    - name: Apply benchmark role unless mountpoint
       ansible.builtin.include_role:
         name: benchmark
+      when: scenario != 'mountpoint'

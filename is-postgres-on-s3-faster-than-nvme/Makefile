@@ -14,13 +14,13 @@ USE_SPOT ?= true
 BUDGET_USD ?= 30
 BUDGET_EMAIL ?=
 
-VALID_SCENARIOS := nvme-ext4 nvme-zfs nvme-zfs-fpi nvme-zfs-rec32k nvme-zfs-rec128k
+VALID_SCENARIOS := nvme-ext4 nvme-zfs nvme-zfs-fpi nvme-zfs-rec32k nvme-zfs-rec128k zerofs-standard zerofs-express zerofs-standard-ext4 zerofs-express-ext4 mountpoint
 VALID_WORKLOADS := tpcb mixed
 
 .PHONY: help up provision bench fetch down destroy clean smoke validate bake bootstrap analysis-up analysis-shell analysis-down
 
 help:
-	@echo "Postgres on NVMe benchmark (Part I of the S3-vs-NVMe series) — Makefile targets"
+	@echo "Postgres on S3 vs NVMe benchmark — Makefile targets"
 	@echo
 	@echo "  make bootstrap                           Create the long-lived results bucket (one-time, idempotent)"
 	@echo "  make up          SCENARIO=<s>            Apply Terraform + run Ansible"
