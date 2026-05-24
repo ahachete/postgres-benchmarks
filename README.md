@@ -16,7 +16,7 @@ This commitment to transparency is detailed in
 
 | Subfolder | Topic | Status |
 |---|---|---|
-| [`is-postgres-on-s3-faster-than-nvme/`](is-postgres-on-s3-faster-than-nvme/) | Postgres on local NVMe — ext4 vs ZFS; single-node vs 3-AZ HA; `full_page_writes` on/off. The NVMe baseline for a larger "Postgres on S3 vs Postgres on NVMe?" series. | Part I published, Part II WIP |
+| [`is-postgres-on-s3-faster-than-nvme/`](is-postgres-on-s3-faster-than-nvme/) | Postgres on local NVMe vs Postgres on S3 — ext4 vs ZFS, FPW on/off, single-node vs 3-AZ HA, ZeroFS on S3 Standard vs S3 Express One Zone, plus Mountpoint-for-S3 as a documented failure. | Part I and Part II published |
 
 
 ## Conventions
