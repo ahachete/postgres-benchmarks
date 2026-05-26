@@ -403,8 +403,12 @@ fair "durable Postgres on NVMe" deployment needs replicas in different AZs.
 - `synchronous_standby_names = 'ANY 1 (replica1, replica2)'` — quorum sync of
   size 1 guarantees at least one peer has the WAL on durable storage at
   COMMIT, while one slow/down replica doesn't stall the primary.
-- `synchronous_commit = on`. Group commit enabled (`commit_delay = 100`,
-  `commit_siblings = 5`) to amortize sync-replica acks under high concurrency.
+- `synchronous_commit = on`. `commit_delay` / `commit_siblings` are left at
+  Postgres defaults (`0` / `5`) — deliberately not tuned. Setting
+  `commit_delay > 0` would add latency to every commit by design, which is
+  exactly the metric the benchmark is measuring. Group-commit batching is
+  a tail-throughput optimization that would distort the latency
+  distribution being compared.
 
 
 ### 9.2 Scenarios
